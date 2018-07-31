@@ -99,6 +99,16 @@ defmodule Uderzo.GenRenderer do
       genserver_opts)
   end
 
+  def set_user_state(new_state) do
+    GenServer.call(Uderzo.GenRenderer, {:set_user_state, new_state})
+  end
+
+  def handle_call({:set_user_state, new_state}, _from, state) do
+    state = %State{state | user_state: new_state}
+    send(self(), :render_next)
+    {:reply, state, state}
+  end
+
   # Just call the uderzo_init() method and let messages from Uderzo drive the rest.
   def init([title, window_width, window_height, target_fps, user_state, user_module]) do
     uderzo_init(self())
