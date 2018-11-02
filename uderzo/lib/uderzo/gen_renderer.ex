@@ -36,9 +36,9 @@ defmodule Uderzo.GenRenderer do
   called during start time but rather as soon as Uderzo is initialized. This means
   that you can call functions to load fonts, etcetera, at initialization time.
 
-  Note that once calls, GenRenderer just goes off and does rendering. There's little
-  interaction possible with it, so there's usually no need to keep the PID around
-  or name it.
+  Note that once called, GenRenderer just goes off and does rendering. There's no
+  requirement to interact with it further, although you can set the user state directly,
+  forcing a redraw if desired.
   """
 
   @doc """
@@ -77,9 +77,11 @@ defmodule Uderzo.GenRenderer do
   use GenServer
   import Uderzo.Bindings
 
+  require Logger
+
   defmodule State do
     defstruct [:title, :window_width, :window_height, :target_fps,
-              :window, :ntt, :user_state, :user_module]
+              :window, :user_state, :user_module, :rendering]
   end
 
   @doc """
@@ -96,14 +98,41 @@ defmodule Uderzo.GenRenderer do
   def start_link(module, title, window_width, window_height, target_fps, args, genserver_opts \\ []) do
     GenServer.start_link(__MODULE__,
       [title, window_width, window_height, target_fps, args, module],
-      genserver_opts)
+      Keyword.merge([name: Uderzo.GenRenderer], genserver_opts))
+  end
+
+  @doc """
+    Set the user_state portion of %State{}. This is the data that gets passed into render.
+    Calling this has the side effect of redrawing the screen.
+  """
+  def set_user_state(new_state) do
+    GenServer.call(Uderzo.GenRenderer, {:set_user_state, new_state})
+  end
+
+  @doc """
+    Get the user_state portion of %State{}. This is the data that gets passed into render.
+  """
+  def get_user_state() do
+    GenServer.call(Uderzo.GenRenderer, :get_user_state)
   end
 
   # Just call the uderzo_init() method and let messages from Uderzo drive the rest.
   def init([title, window_width, window_height, target_fps, user_state, user_module]) do
     uderzo_init(self())
     {:ok, %State{title: title, window_width: window_width, window_height: window_height,
-      target_fps: target_fps, user_state: user_state, user_module: user_module}}
+      target_fps: target_fps, user_state: user_state, user_module: user_module, rendering: false}}
+  end
+
+  # Get the user state .
+  def handle_call(:get_user_state, _from, state) do
+    {:reply, state.user_state, state}
+  end
+
+  # Set the user state directly and trigger a screen redraw.
+  def handle_call({:set_user_state, new_state}, _from, state) do
+    state = %State{state | user_state: new_state}
+    send(self(), :render_next)
+    {:reply, state, state}
   end
 
   # On uderzo_init completion, we receive :uderzo_initialized and can therefore create a window.
@@ -114,18 +143,22 @@ defmodule Uderzo.GenRenderer do
 
   # On window creation completion, we can kick off the rendering loop.
   # However, first we have promised to talk to the user initialization code
-  def handle_info({:glfw_create_window_result, window}, state) do
+  def handle_info({:glfw_create_window_result, window}, %{target_fps: target_fps} = state) do
     {:ok, user_state} = state.user_module.init_renderer(state.user_state)
+    int = Kernel.trunc(1_000 / target_fps)
     send(self(), :render_next)
+    :timer.send_interval(int, self(), :render_next)
     {:noreply, %State{state | window: window, user_state: user_state}}
   end
 
-  # We should render a frame. Calculate right away when the _next_ frame
-  # should start and tell Uderzo we're beginning a frame
+  def handle_info(:render_next, %State{rendering: true} = state) do
+    Logger.warn("skipping frame, render already in progress")
+    {:noreply, state}
+  end
+
   def handle_info(:render_next, state) do
-    ntt = next_target_time(state.target_fps)
     uderzo_start_frame(state.window, self())
-    {:noreply, %State{state | ntt: ntt}}
+    {:noreply, %{state | rendering: true}}
   end
 
   # Uderzo tells us we're good to do the actual rendering
@@ -137,12 +170,6 @@ defmodule Uderzo.GenRenderer do
 
   # And finally, the frame is rendered. Schedule the next frame
   def handle_info({:uderzo_end_frame_done, _window}, state) do
-    Process.send_after(self(), :render_next, nap_time(state.ntt))
-    {:noreply, state}
+    {:noreply, %{state | rendering: false}}
   end
-
-  defp cur_time, do: :erlang.monotonic_time(:millisecond)
-  defp next_target_time(fps), do: cur_time() + div(1_000, fps)
-  defp nap_time(ntt), do: max(0, ntt - cur_time())
-
 end
